@@ -10,78 +10,73 @@ import io.muun.apollo.data.external.NotificationService
 import io.muun.apollo.data.os.execution.ExecutionTransformerFactory
 import io.muun.apollo.domain.LoggingContextManager
 import io.muun.apollo.domain.action.UserActions
-import io.muun.common.utils.Preconditions
 import timber.log.Timber
 import javax.inject.Inject
+import javax.inject.Provider
+import kotlin.reflect.KClass
 
-/**
- * This is what WorkManager's API has to offer for dependency injection logic. Instantion of workers
- * happen on background and some of our injected dependencies (e.g ClipboardProvider) need to be
- * instantiated and injected on mainThread. For more info:
- * https://developer.android.com/topic/libraries/architecture/workmanager/advanced/custom-configuration
- */
-class MuunWorkerFactory(provider: DataComponentProvider) : WorkerFactory() {
-
-    @Inject
-    lateinit var taskDispatcher: TaskDispatcher
-
-    @Inject
-    lateinit var userActions: UserActions
-
-    @Inject
-    lateinit var loggingContextManager: LoggingContextManager
-
-    @Inject
-    lateinit var transformerFactory: ExecutionTransformerFactory
-
-    @Inject
-    lateinit var notificationService: NotificationService
+class MuunWorkerFactory @Inject constructor(
+    private val provider: DataComponentProvider,
+    @Inject private val taskDispatcher: TaskDispatcher,
+    @Inject private val userActions: UserActions,
+    @Inject private val loggingContextManager: LoggingContextManager,
+    @Inject private val transformerFactory: ExecutionTransformerFactory,
+    @Inject private val notificationService: NotificationService,
+    @Inject private val workerProviders: Map<Class<out Worker>, @JvmSuppressWildcards Provider<Worker>>
+) : WorkerFactory() {
 
     init {
-        Timber.d("[MuunWorkerFactory] Execute Dependency Injection")
+        Timber.d("[MuunWorkerFactory] Initializing with dependency injection")
         provider.dataComponent.inject(this)
     }
 
     override fun createWorker(
         appContext: Context,
         workerClassName: String,
-        workerParameters: WorkerParameters,
+        workerParameters: WorkerParameters
     ): ListenableWorker? {
+        return try {
+            Timber.d("[MuunWorkerFactory] Creating worker: $workerClassName")
+            val workerClass = Class.forName(workerClassName).asSubclass(Worker::class.java)
+            
+            loggingContextManager.setupCrashlytics()
 
-        Timber.d("[MuunWorkerFactory] Create worker for $workerClassName")
-        val workerClass = Class.forName(workerClassName)
-
-        // Should be enforce by WorkManager API but still (why don't they use Class param?!)
-        Preconditions.checkArgument(Worker::class.java.isAssignableFrom(workerClass))
-
-        loggingContextManager.setupCrashlytics()
-
-        when (workerClass) {
-            PeriodicTaskWorker::class.java -> {
-
-                return PeriodicTaskWorker(
-                    appContext,
-                    workerParameters,
-                    taskDispatcher,
-                    userActions,
-                    transformerFactory
-                )
-
+            when {
+                workerProviders.containsKey(workerClass) -> {
+                    workerProviders[workerClass]?.get()?.apply {
+                        updateParams(workerParameters)
+                    }
+                }
+                else -> {
+                    Timber.w("[MuunWorkerFactory] No provider found for $workerClassName, falling back")
+                    null
+                }
             }
+        } catch (e: ClassNotFoundException) {
+            Timber.e(e, "[MuunWorkerFactory] Failed to find worker class: $workerClassName")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "[MuunWorkerFactory] Error creating worker: $workerClassName")
+            null
+        }
+    }
 
-            LnPaymentFailedNotificationWorker::class.java -> {
-                return LnPaymentFailedNotificationWorker(
-                    appContext,
-                    workerParameters,
-                    notificationService
-                )
-            }
-
-            else -> {
-                // This tells WorkManager that your factory can't create this Worker, and it will
-                // fall back to its default method of Worker creation.
-                // See: https://github.com/square/leakcanary/issues/2283
-                return null
+    companion object {
+        /**
+         * Extension function to update worker parameters for workers created via DI
+         */
+        private fun Worker.updateParams(params: WorkerParameters): Worker {
+            return this.apply {
+                // Reflection approach to update final fields if needed
+                // Alternative: Have workers implement a ParamUpdateable interface
+                try {
+                    val field = Worker::class.java.getDeclaredField("mAppContext").apply {
+                        isAccessible = true
+                    }
+                    field.set(this, params)
+                } catch (e: Exception) {
+                    Timber.w(e, "Failed to update worker parameters")
+                }
             }
         }
     }
