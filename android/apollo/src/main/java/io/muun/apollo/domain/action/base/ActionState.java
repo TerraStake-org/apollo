@@ -1,77 +1,88 @@
-package io.muun.apollo.domain.action.base;
+package io.muun.apollo.domain.action.address;
 
-public final class ActionState<T> {
+import io.muun.apollo.domain.action.base.BaseAsyncAction1;
+import io.muun.apollo.domain.action.incoming_swap.GenerateInvoiceAction;
+import io.muun.apollo.domain.libwallet.DecodedBitcoinUri;
+import io.muun.apollo.domain.libwallet.Invoice;
+import io.muun.apollo.domain.model.BitcoinAmount;
+import io.muun.apollo.domain.model.MuunAddressGroup;
+import org.bitcoinj.core.NetworkParameters;
+import rx.Observable;
+import rx.schedulers.Schedulers;
+import timber.log.Timber;
 
-    private static final ActionState EMPTY_STATE = new ActionState<>(Kind.EMPTY, null, null);
+import javax.inject.Inject;
 
-    private static final ActionState LOADING_STATE = new ActionState<>(Kind.LOADING, null, null);
+public class GenerateBip21UriAction extends BaseAsyncAction1<BitcoinAmount, DecodedBitcoinUri> {
 
-    private final Kind kind;
+    private static final String TAG = "GenerateBip21Uri";
+    private static final String INVOICE_DECODE_ERROR = "Invoice decode failed";
 
-    private final T value;
+    private final NetworkParameters networkParameters;
+    private final GenerateInvoiceAction generateInvoice;
+    private final CreateAddressAction createAddress;
 
-    private final Throwable throwable;
-
-    @SuppressWarnings("unchecked")
-    public static <T> ActionState<T> createEmpty() {
-        return EMPTY_STATE;
+    @Inject
+    public GenerateBip21UriAction(
+            NetworkParameters networkParameters,
+            GenerateInvoiceAction generateInvoice,
+            CreateAddressAction createAddress
+    ) {
+        this.networkParameters = networkParameters;
+        this.generateInvoice = generateInvoice;
+        this.createAddress = createAddress;
     }
 
-    @SuppressWarnings("unchecked")
-    public static <T> ActionState<T> createLoading() {
-        return LOADING_STATE;
+    @Override
+    public Observable<DecodedBitcoinUri> action(BitcoinAmount amount) {
+        return Observable.zip(
+                getAddressGroup(),
+                getInvoice(amount),
+                (addressGroup, invoice) -> createDecodedUri(addressGroup, invoice, amount)
+        )
+        .onErrorResumeNext(error -> {
+            Timber.tag(TAG).e(error, "BIP21 URI generation failed");
+            return Observable.error(error);
+        })
+        .subscribeOn(Schedulers.io());
     }
 
-    public static <T> ActionState<T> createValue(T value) {
-        return new ActionState<>(Kind.VALUE, value, null);
+    private Observable<MuunAddressGroup> getAddressGroup() {
+        return createAddress.action()
+                .doOnNext(addressGroup -> Timber.tag(TAG).d("Address group generated"))
+                .map(MuunAddressGroup::toAddressGroup);
     }
 
-    public static <T> ActionState<T> createError(Throwable throwable) {
-        return new ActionState<>(Kind.ERROR, null, throwable);
+    private Observable<String> getInvoice(BitcoinAmount amount) {
+        Long satoshis = amount != null ? amount.inSatoshis : null;
+        return generateInvoice.action(satoshis)
+                .doOnNext(invoice -> 
+                    Timber.tag(TAG).d("Invoice generated for amount: %s sat", satoshis)
+                );
     }
 
-    public static ActionState<Void> dropValue(ActionState<?> otherState) {
-        return new ActionState<>(otherState.kind, null, otherState.throwable);
+    private DecodedBitcoinUri createDecodedUri(
+            MuunAddressGroup addressGroup, 
+            String invoice,
+            BitcoinAmount amount
+    ) {
+        try {
+            Invoice decodedInvoice = Invoice.decodeInvoice(networkParameters, invoice);
+            if (decodedInvoice == null) {
+                throw new IllegalArgumentException("Null invoice returned from decoder");
+            }
+            
+            Timber.tag(TAG).v("Invoice successfully decoded");
+            return new DecodedBitcoinUri(addressGroup, decodedInvoice, amount);
+        } catch (Exception e) {
+            Timber.tag(TAG).e(e, INVOICE_DECODE_ERROR);
+            throw new InvoiceDecodeException(INVOICE_DECODE_ERROR, e);
+        }
     }
 
-    private ActionState(Kind kind, T value, Throwable throwable) {
-        this.kind = kind;
-        this.value = value;
-        this.throwable = throwable;
-    }
-
-    public boolean isEmpty() {
-        return kind == Kind.EMPTY;
-    }
-
-    public boolean isLoading() {
-        return kind == Kind.LOADING;
-    }
-
-    public boolean isValue() {
-        return kind == Kind.VALUE;
-    }
-
-    public boolean isError() {
-        return kind == Kind.ERROR;
-    }
-
-    public T getValue() {
-        return value;
-    }
-
-    public Throwable getError() {
-        return throwable;
-    }
-
-    public Kind getKind() {
-        return kind;
-    }
-
-    public enum Kind {
-        EMPTY,
-        LOADING,
-        VALUE,
-        ERROR
+    public static class InvoiceDecodeException extends Exception {
+        public InvoiceDecodeException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 }
