@@ -27,42 +27,33 @@ import java.util.concurrent.Executor
 import javax.inject.Inject
 import javax.inject.Singleton
 
-// FileMetadata removes the need for fully-qualified paths for `File`, which is also a Java stdlib
-// class. The Drive variant, by the way, is actually a collection of metadata.
-typealias FileMetadata = com.google.api.services.drive.model.File
-
+private const val MAX_RESULTS = 100
+private const val ALL_FIELDS = "*"
+private const val DRIVE_FOLDER_TYPE = "application/vnd.google-apps.folder"
+private const val DRIVE_FOLDER_NAME = "Muun"
+private const val DRIVE_FOLDER_PARENT = "root"
 
 @Singleton
 class DriveImpl @Inject constructor(
-    val context: Context,
-    val executor: Executor,
-) :
-    DriveAuthenticator,
-    DriveUploader {
+    private val context: Context,
+    private val executor: Executor
+) : DriveAuthenticator, DriveUploader {
 
-    companion object {
-        const val DRIVE_FOLDER_TYPE = "application/vnd.google-apps.folder"
-        const val DRIVE_FOLDER_NAME = "Muun"
-        const val DRIVE_FOLDER_PARENT = "root"
-    }
+    private val signInClient by lazy { createSignInClient() }
 
-    private val signInClient by lazy {
-        createSignInClient()
-    }
-
-    override fun getSignInIntent() =
-        signInClient.signInIntent
+    override fun getSignInIntent(): Intent = signInClient.signInIntent
 
     override fun getSignedInAccount(resultIntent: Intent?): GoogleSignInAccount {
-        val completedTask = GoogleSignIn.getSignedInAccountFromIntent(resultIntent)
-
-        // This is needlessly wrapped in a Task. If you check the implementation, you'll see it's
-        // all perfectly synchronous. The Task instance is created from available data, much like
-        // calling Observable.just(result) or Observable.error(exception).
-        if (completedTask.isSuccessful) {
-            return completedTask.result!!
-        } else {
-            throw DriveError(completedTask.exception!!)
+        return try {
+            val completedTask = GoogleSignIn.getSignedInAccountFromIntent(resultIntent)
+            if (completedTask.isSuccessful) {
+                completedTask.result ?: throw DriveError("Null account returned")
+            } else {
+                throw DriveError(completedTask.exception ?: Exception("Unknown error"))
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to get signed in account")
+            throw DriveError(e)
         }
     }
 
@@ -70,51 +61,68 @@ class DriveImpl @Inject constructor(
         file: File,
         mimeType: String,
         uniqueProp: String,
-        props: Map<String, String>,
+        props: Map<String, String>
     ): Observable<DriveFile> {
-
+        Preconditions.checkArgument(props.containsKey(uniqueProp))
+        
         val resultSubject = PublishSubject.create<DriveFile>()
+        
+        Tasks.call(executor) {
+            executeUpload(file, mimeType, uniqueProp, props)
+        }.addOnSuccessListener { driveFile ->
+            resultSubject.onNext(driveFile)
+            resultSubject.onCompleted()
+        }.addOnFailureListener { error ->
+            Timber.e(error, "Failed to upload file")
+            resultSubject.onError(DriveError(error))
+            resultSubject.onCompleted()
+        }
 
-        Tasks.call(executor) { executeUpload(file, mimeType, uniqueProp, props) }
-            .addOnSuccessListener {
-                resultSubject.onNext(it)
-                resultSubject.onCompleted()
-            }
-            .addOnFailureListener {
-                resultSubject.onError(DriveError(it))
-                resultSubject.onCompleted()
-            }
-
-        return resultSubject.asObservable()
-            .observeOn(Schedulers.from(executor)) // Task invokes callbacks in the main thread
+        return resultSubject
+            .asObservable()
+            .observeOn(Schedulers.from(executor))
     }
 
     override fun open(activityContext: Context, driveFile: DriveFile) {
-        // Link to the parent directory, or the file itself otherwise:
-        val link = driveFile.parent?.link ?: driveFile.link
-
-        // This Intent will launch the Drive app, or if that's not available (very unlikely) a
-        // browser page that has pretty much the same UI.
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(link))
-
-        activityContext.startActivity(intent)
-    }
-
-    override fun signOut() {
-        signInClient.revokeAccess().continueWith { signInClient.signOut() }.addOnCompleteListener {
-            Timber.d("Logged out")
+        try {
+            val link = driveFile.parent?.link ?: driveFile.link
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(link)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            activityContext.startActivity(intent)
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to open Drive file")
+            throw DriveError(e)
         }
     }
 
+    override fun signOut() {
+        signInClient.revokeAccess()
+            .continueWith { signInClient.signOut() }
+            .addOnCompleteListener {
+                Timber.d("Successfully signed out from Drive")
+            }
+            .addOnFailureListener { error ->
+                Timber.e(error, "Failed to sign out from Drive")
+            }
+    }
+
     private fun createDriveService(): Drive {
-        val credential = GoogleAccountCredential
-            .usingOAuth2(context, listOf(DriveScopes.DRIVE_FILE))
+        return try {
+            val credential = GoogleAccountCredential
+                .usingOAuth2(context, listOf(DriveScopes.DRIVE_FILE))
+                .apply {
+                    selectedAccount = GoogleSignIn.getLastSignedInAccount(context)?.account
+                        ?: throw IllegalStateException("No signed in account")
+                }
 
-        credential.selectedAccount = GoogleSignIn.getLastSignedInAccount(context)!!.account
-
-        return Drive.Builder(NetHttpTransport(), GsonFactory(), credential)
-            .setApplicationName("Muun")
-            .build()
+            Drive.Builder(NetHttpTransport(), GsonFactory(), credential)
+                .setApplicationName("Muun")
+                .build()
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to create Drive service")
+            throw DriveError(e)
+        }
     }
 
     private fun createSignInClient(): GoogleSignInClient {
@@ -130,19 +138,13 @@ class DriveImpl @Inject constructor(
         file: File,
         mimeType: String,
         uniqueProp: String,
-        props: Map<String, String>,
+        props: Map<String, String>
     ): DriveFile {
-
-        Preconditions.checkArgument(props.containsKey(uniqueProp))
-
         val driveService = createDriveService()
-        val folder = getExistingMuunFolder(driveService) ?: createNewMuunFolder(driveService)
+        val folder = getOrCreateMuunFolder(driveService)
 
-        // We want to either update an existing file or create a new one. This depends on whether
-        // we're reasonably sure that an existing entry is conceptually the same file as the one
-        // we're uploading.
         val updateCandidates = getUpdateCandidates(driveService, file.name, mimeType, folder)
-        val fileToUpdate = getFileToUpdate(updateCandidates, uniqueProp, props[uniqueProp]!!)
+        val fileToUpdate = findFileToUpdate(updateCandidates, uniqueProp, props[uniqueProp]!!)
 
         return if (fileToUpdate != null) {
             updateFile(driveService, fileToUpdate, file, props, keepRevision = true)
@@ -151,25 +153,29 @@ class DriveImpl @Inject constructor(
         }
     }
 
+    private fun getOrCreateMuunFolder(driveService: Drive): DriveFile {
+        return getExistingMuunFolder(driveService) ?: createNewMuunFolder(driveService)
+    }
+
     private fun createFile(
         driveService: Drive,
         mimeType: String,
         file: File,
         folder: DriveFile,
-        props: Map<String, String> = mapOf(),
+        props: Map<String, String>
     ): DriveFile {
-
-        val metadata = FileMetadata()
-            .setParents(listOf(folder.id))
-            .setMimeType(mimeType)
-            .setName(file.name)
-            .setAppProperties(props)
+        val metadata = FileMetadata().apply {
+            parents = listOf(folder.id)
+            this.mimeType = mimeType
+            name = file.name
+            appProperties = props
+        }
 
         val content = FileContent(mimeType, file)
 
         return driveService.files()
             .create(metadata, content)
-            .setFields("*") // populate all response fields (eg permalink, by default some are null)
+            .setFields(ALL_FIELDS)
             .execute()
             .let { toDriveFile(it, folder) }
     }
@@ -178,124 +184,128 @@ class DriveImpl @Inject constructor(
         driveService: Drive,
         existingFile: DriveFile,
         newContent: File,
-        newProps: Map<String, String> = mapOf(),
-        keepRevision: Boolean = false,
+        newProps: Map<String, String>,
+        keepRevision: Boolean
     ): DriveFile {
-
         if (keepRevision) {
-            setKeepRevision(driveService, existingFile) // TODO: after 200 revisions, this will fail
+            setKeepRevision(driveService, existingFile)
         }
 
-        val metadata = FileMetadata()
-            .setAppProperties(newProps) // includes only the props we want to set
+        val metadata = FileMetadata().apply {
+            appProperties = newProps
+        }
 
         val content = FileContent(existingFile.mimeType, newContent)
 
         return driveService.files()
             .update(existingFile.id, metadata, content)
-            .setFields("*") // populate all response fields (eg permalink, by default some are null)
+            .setFields(ALL_FIELDS)
             .execute()
             .let { toDriveFile(it, existingFile.parent) }
     }
 
-    private fun setKeepRevision(driveService: Drive, existingFile: DriveFile) {
-        val revision = Revision()
-        revision.keepForever = true
-
-        driveService.revisions()
-            .update(existingFile.id, existingFile.revisionId, revision)
-            .execute()
+    private fun setKeepRevision(driveService: Drive, file: DriveFile) {
+        try {
+            val revision = Revision().apply {
+                keepForever = true
+            }
+            driveService.revisions()
+                .update(file.id, file.revisionId, revision)
+                .execute()
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to set keepForever on revision")
+        }
     }
 
     private fun createNewMuunFolder(driveService: Drive): DriveFile {
-        val metadata = FileMetadata()
-            .setParents(listOf(DRIVE_FOLDER_PARENT))
-            .setMimeType(DRIVE_FOLDER_TYPE)
-            .setName(DRIVE_FOLDER_NAME)
+        val metadata = FileMetadata().apply {
+            parents = listOf(DRIVE_FOLDER_PARENT)
+            mimeType = DRIVE_FOLDER_TYPE
+            name = DRIVE_FOLDER_NAME
+        }
 
         return driveService.files()
             .create(metadata)
-            .setFields("*") // populate all response fields (eg permalink, by default some are null)
+            .setFields(ALL_FIELDS)
             .execute()
             .let { toDriveFile(it) }
     }
 
     private fun getExistingMuunFolder(driveService: Drive): DriveFile? {
-        val query = sanitizeDriveQuery(
-            """
-            mimeType='$DRIVE_FOLDER_TYPE' and 
-            name='$DRIVE_FOLDER_NAME' and 
-            '$DRIVE_FOLDER_PARENT' in parents and
-            trashed=false
-            """
+        val query = buildDriveQuery(
+            mimeType = DRIVE_FOLDER_TYPE,
+            name = DRIVE_FOLDER_NAME,
+            parentId = DRIVE_FOLDER_PARENT
         )
 
         return driveService.files()
             .list()
             .setQ(query)
-            .setFields("*") // populate all response fields (eg permalink, by default some are null)
+            .setFields(ALL_FIELDS)
             .execute()
             .files
-            .getOrNull(0) // note: there could be multiple "/Muun" folders (yes), we'll pick 1st
+            .firstOrNull()
             ?.let { toDriveFile(it) }
-    }
-
-    private fun getFileToUpdate(
-        candidates: List<DriveFile>,
-        uniqueProp: String,
-        uniqueValue: String,
-    ): DriveFile? {
-
-        // If this is the only file, created before the addition of properties, pick it:
-        if (candidates.size == 1 && !candidates[0].properties.containsKey(uniqueProp)) {
-            return candidates[0]
-        }
-
-        // Otherwise, pick any file with a matching `uniqueProp` (or null):
-        return candidates.find { it.properties[uniqueProp] == uniqueValue }
     }
 
     private fun getUpdateCandidates(
         driveService: Drive,
         name: String,
         mimeType: String,
-        folder: DriveFile,
+        folder: DriveFile
     ): List<DriveFile> {
-
-        val query = sanitizeDriveQuery(
-            """
-            mimeType='$mimeType' and 
-            name='$name' and 
-            '${folder.id}' in parents and
-            trashed=false
-            """
+        val query = buildDriveQuery(
+            mimeType = mimeType,
+            name = name,
+            parentId = folder.id
         )
-
-        // NOTE:
-        // If there's more than 100 competing files (max results at the time of writing), we only
-        // get those first 100. Good enough.
 
         return driveService.files()
             .list()
             .setQ(query)
-            .setFields("*")
+            .setFields(ALL_FIELDS)
+            .setMaxResults(MAX_RESULTS.toLong())
             .execute()
             .files
             .map { toDriveFile(it) }
     }
 
-    private fun toDriveFile(metadata: FileMetadata, parentFile: DriveFile? = null) =
-        DriveFile(
-            metadata.id,
-            metadata.headRevisionId ?: "", // folders don't have revisions. Oh well.
-            metadata.name,
-            metadata.mimeType,
-            metadata.size,
-            metadata.webViewLink,
-            parentFile,
-            metadata.appProperties ?: mapOf()
-        )
+    private fun findFileToUpdate(
+        candidates: List<DriveFile>,
+        uniqueProp: String,
+        uniqueValue: String
+    ): DriveFile? {
+        return when {
+            candidates.size == 1 && !candidates[0].properties.containsKey(uniqueProp) -> 
+                candidates[0]
+            else -> 
+                candidates.find { it.properties[uniqueProp] == uniqueValue }
+        }
+    }
 
-    private fun sanitizeDriveQuery(query: String) =
-        query.trimIndent().trim().replace("\n", " ")
+    private fun buildDriveQuery(
+        mimeType: String,
+        name: String,
+        parentId: String
+    ): String {
+        return """
+            mimeType='$mimeType' and 
+            name='$name' and 
+            '$parentId' in parents and
+            trashed=false
+        """.trimIndent().replace("\n", " ")
+    }
+
+    private fun toDriveFile(metadata: FileMetadata, parentFile: DriveFile? = null): DriveFile {
+        return DriveFile(
+            id = metadata.id,
+            revisionId = metadata.headRevisionId ?: "",
+            name = metadata.name,
+            mimeType = metadata.mimeType,
+            size = metadata.size,
+            link = metadata.webViewLink,
+            parent = parentFile,
+            properties = metadata.appProperties ?: emptyMap()
+        )
+    }
 }
