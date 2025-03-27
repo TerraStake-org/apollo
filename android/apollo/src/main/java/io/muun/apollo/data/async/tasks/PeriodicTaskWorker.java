@@ -1,112 +1,113 @@
-package io.muun.apollo.data.async.tasks;
+package io.muun.apollo.data.async.tasks
 
-import io.muun.apollo.data.os.execution.ExecutionTransformerFactory;
-import io.muun.apollo.domain.action.UserActions;
-import io.muun.apollo.domain.errors.NoStackTraceException;
-import io.muun.apollo.domain.errors.PeriodicTaskError;
-import io.muun.common.utils.Preconditions;
+import android.content.Context
+import android.os.SystemClock
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParameters
+import io.muun.apollo.data.os.execution.ExecutionTransformerFactory
+import io.muun.apollo.domain.action.UserActions
+import io.muun.apollo.domain.errors.PeriodicTaskError
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import javax.inject.Inject
+import kotlin.time.Duration.Companion.milliseconds
 
-import android.content.Context;
-import android.os.SystemClock;
-import androidx.annotation.NonNull;
-import androidx.work.Worker;
-import androidx.work.WorkerParameters;
-import timber.log.Timber;
+class PeriodicTaskWorker @Inject constructor(
+    context: Context,
+    params: WorkerParameters,
+    private val taskDispatcher: TaskDispatcher,
+    private val userActions: UserActions,
+    private val transformerFactory: ExecutionTransformerFactory
+) : CoroutineWorker(context, params) {
 
-public class PeriodicTaskWorker extends Worker {
-
-    public static final String TASK_TYPE_KEY = "taskType";
-
-    private final TaskDispatcher taskDispatcher;
-
-    private final UserActions userActions;
-
-    private final ExecutionTransformerFactory transformerFactory;
-
-    /**
-     * Constructor. This is now called from background (WorkManager handles it) so dependency
-     * injection is handled by a WorkFactory. See MuunWorkerFactory.
-     */
-    public PeriodicTaskWorker(@NonNull Context context,
-                              @NonNull WorkerParameters workerParams,
-                              TaskDispatcher taskDispatcher,
-                              UserActions userActions,
-                              ExecutionTransformerFactory transformerFactory) {
-        super(context, workerParams);
-        this.taskDispatcher = taskDispatcher;
-        this.userActions = userActions;
-        this.transformerFactory = transformerFactory;
-
-        Timber.d("Starting PeriodicTaskService");
+    companion object {
+        const val TASK_TYPE_KEY = "taskType"
+        private const val TAG = "PeriodicTaskWorker"
     }
 
-    @Override
-    @NonNull
-    public Result doWork() {
+    init {
+        Timber.tag(TAG).d("Initializing PeriodicTaskWorker")
+    }
 
+    override suspend fun doWork(): Result {
         if (!userActions.isLoggedIn()) {
-            return Result.success();
+            Timber.tag(TAG).d("User not logged in, skipping task")
+            return Result.success()
         }
 
-        // The scheduler will hold a PowerManager.WakeLock for your service, however after three
-        // minutes of execution if your task has not returned it will be considered to have timed
-        // out, and the wakelock will be released.
+        val type = requireNotNull(inputData.getString(TASK_TYPE_KEY)) {
+            "Task type must be provided in input data"
+        }
 
-        final String type = Preconditions.checkNotNull(getInputData().getString(TASK_TYPE_KEY));
+        Timber.tag(TAG).d("Running periodic task of type: $type")
+        val startTime = SystemClock.elapsedRealtime()
 
-        Timber.d("Running periodic task of type %s", type);
+        return try {
+            executeTask(type, startTime)
+            Result.success()
+        } catch (e: Exception) {
+            handleTaskError(type, startTime, e)
+        }
+    }
 
-        final long startMs = SystemClock.elapsedRealtime();
-
-        try {
-
+    private suspend fun executeTask(type: String, startTime: Long) {
+        withContext(Dispatchers.IO) {
             taskDispatcher.dispatch(type)
-                    .doOnError(throwable -> {
-
-                        if (throwable.getStackTrace() == null) {
-                            fillInStackTrace(throwable);
-                        }
-
-                        if (throwable.getStackTrace() == null) {
-
-                            final String message = String.format(
-                                    "Exception of type %s with no stacktrace, while running a "
-                                            + "periodic task of type %s. Message: %s.",
-                                    throwable.getClass().getCanonicalName(),
-                                    type,
-                                    throwable.getMessage()
-                            );
-
-                            throwable = new NoStackTraceException(message);
-                        }
-
-                        Timber.e(throwable);
-                    })
-                    .compose(transformerFactory.getAsyncExecutor())
-                    .toBlocking()
-                    .subscribe();
-
-        } catch (RuntimeException error) {
-            Timber.e(new PeriodicTaskError(type, secondsSince(startMs), error));
-            return Result.retry();
+                .compose(transformerFactory.getAsyncExecutor())
+                .doOnError { error ->
+                    logTaskError(type, error)
+                }
+                .await()
         }
 
-        Timber.d("Success after " + secondsSince(startMs) + "s on periodic %s", type);
-        return Result.success();
+        val duration = (SystemClock.elapsedRealtime() - startTime).milliseconds
+        Timber.tag(TAG).d("Successfully completed task $type in $duration")
     }
 
-    private void fillInStackTrace(Throwable throwable) {
-        // Keep this in its own method, in order to have an understandable stack-trace.
-        throwable.fillInStackTrace();
+    private fun logTaskError(type: String, error: Throwable) {
+        val enhancedError = if (error.stackTrace.isNullOrEmpty()) {
+            PeriodicTaskError(
+                type = type,
+                cause = RuntimeException(
+                    "Exception with no stacktrace while running periodic task of type $type",
+                    error
+                )
+            )
+        } else {
+            PeriodicTaskError(type, error)
+        }
+
+        Timber.tag(TAG).e(enhancedError)
     }
 
-    @Override
-    public void onStopped() {
-        super.onStopped();
-        Timber.d("Stopping PeriodicTaskWorker");
+    private fun handleTaskError(type: String, startTime: Long, error: Exception): Result {
+        val duration = (SystemClock.elapsedRealtime() - startTime).milliseconds
+        Timber.tag(TAG).e(error, "Failed to complete task $type after $duration")
+
+        return when {
+            // Retry for transient errors
+            error.isTransient() -> Result.retry()
+            // Success for known non-retryable errors
+            error.isNonRetryable() -> Result.success()
+            // Failure for other cases
+            else -> Result.failure()
+        }
     }
 
-    private long secondsSince(long startingRealtime) {
-        return (SystemClock.elapsedRealtime() - startingRealtime) / 1000;
+    override fun onStopped() {
+        Timber.tag(TAG).d("PeriodicTaskWorker stopped")
+        super.onStopped()
     }
+}
+
+// Extension functions for error classification
+private fun Throwable.isTransient(): Boolean {
+    return this is java.net.UnknownHostException || 
+           this is java.net.ConnectException
+}
+
+private fun Throwable.isNonRetryable(): Boolean {
+    return this is IllegalArgumentException ||
+           this is IllegalStateException
 }
