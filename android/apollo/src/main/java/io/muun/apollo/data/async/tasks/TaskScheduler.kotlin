@@ -1,0 +1,109 @@
+package io.muun.apollo.data.async.tasks
+
+import android.content.Context
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
+import androidx.work.Data
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.PeriodicWorkRequest
+import androidx.work.WorkManager
+import timber.log.Timber
+import java.util.concurrent.TimeUnit
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.days
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.toJavaDuration
+
+@Singleton
+class TaskScheduler @Inject constructor(
+    private val context: Context
+) {
+    companion object {
+        private val PULL_NOTIFICATIONS_INTERVAL = 3.hours.toJavaDuration()
+        private val FALLBACK_SYNC_INTERVAL = 6.hours.toJavaDuration()
+        private val INTEGRITY_CHECK_INTERVAL = 1.days.toJavaDuration()
+        private val INITIAL_DELAY = 5.seconds.toJavaDuration()
+        private val BACKOFF_DELAY = 30.seconds.toJavaDuration()
+    }
+
+    /**
+     * Schedule all periodic tasks that should run when user is logged in
+     */
+    fun scheduleAllTasks() {
+        // Notifications usually arrive via FCM, with periodic pull as fallback
+        schedulePeriodicTask(
+            type = PeriodicTaskWorker.PULL_NOTIFICATIONS,
+            interval = PULL_NOTIFICATIONS_INTERVAL
+        )
+
+        // Fallback sync for various data types
+        listOf(
+            PeriodicTaskWorker.SYNC_PHONE_CONTACTS,
+            PeriodicTaskWorker.SYNC_REAL_TIME_DATA,
+            PeriodicTaskWorker.SYNC_EXTERNAL_ADDRESSES,
+            PeriodicTaskWorker.REGISTER_INVOICES
+        ).forEach { type ->
+            schedulePeriodicTask(type, FALLBACK_SYNC_INTERVAL)
+        }
+
+        // Integrity check to detect potential data inconsistencies
+        schedulePeriodicTask(
+            type = PeriodicTaskWorker.CHECK_INTEGRITY,
+            interval = INTEGRITY_CHECK_INTERVAL
+        )
+    }
+
+    /**
+     * Cancel all scheduled tasks
+     */
+    fun unscheduleAllTasks() {
+        try {
+            workManager.cancelAllWork()
+            Timber.d("Cancelled all scheduled tasks")
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to cancel scheduled tasks")
+        }
+    }
+
+    private fun schedulePeriodicTask(type: String, interval: java.time.Duration) {
+        val inputData = Data.Builder()
+            .putString(PeriodicTaskWorker.TASK_TYPE_KEY, type)
+            .build()
+
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+
+        val workRequest = PeriodicWorkRequest.Builder(
+            PeriodicTaskWorker::class.java,
+            interval.seconds,
+            TimeUnit.SECONDS
+        ).apply {
+            setInputData(inputData)
+            setConstraints(constraints)
+            setInitialDelay(INITIAL_DELAY.seconds, TimeUnit.SECONDS)
+            setBackoffCriteria(
+                BackoffPolicy.EXPONENTIAL,
+                BACKOFF_DELAY.seconds,
+                TimeUnit.SECONDS
+            )
+        }.build()
+
+        try {
+            workManager.enqueueUniquePeriodicWork(
+                type,
+                ExistingPeriodicWorkPolicy.REPLACE,
+                workRequest
+            )
+            Timber.d("Scheduled periodic task: $type (interval: ${interval.seconds}s)")
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to schedule task: $type")
+        }
+    }
+
+    private val workManager: WorkManager
+        get() = WorkManager.getInstance(context)
+}
