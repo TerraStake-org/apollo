@@ -1,32 +1,51 @@
 package io.muun.apollo.data.async.tasks
 
 import android.content.Context
-import androidx.work.Worker
+import androidx.work.CoroutineWorker
+import androidx.work.Data
 import androidx.work.WorkerParameters
 import io.muun.apollo.data.external.NotificationService
+import io.muun.apollo.domain.errors.LnUrlWithdrawParseError
 import io.muun.apollo.domain.model.LnUrlWithdraw
+import timber.log.Timber
+import javax.inject.Inject
 
-/**
- * Constructor. This is now called from background (WorkManager handles it) so dependency
- * injection is handled by a WorkFactory. See MuunWorkerFactory.
- */
-class LnPaymentFailedNotificationWorker(
-    val context: Context,
-    val params: WorkerParameters,
-    val notificationService: NotificationService
-): Worker(context, params) {
+class LnPaymentFailedNotificationWorker @Inject constructor(
+    context: Context,
+    params: WorkerParameters,
+    private val notificationService: NotificationService
+) : CoroutineWorker(context, params) {
 
     companion object {
-        const val LNURL_WITHDRAW = "lnUrlWithdraw"
+        const val LNURL_WITHDRAW_KEY = "lnUrlWithdraw"
+        
+        fun createInputData(lnUrlWithdraw: LnUrlWithdraw): Data {
+            return Data.Builder()
+                .putString(LNURL_WITHDRAW_KEY, lnUrlWithdraw.serialize())
+                .build()
+        }
     }
 
-    override fun doWork(): Result {
+    override suspend fun doWork(): Result {
+        return try {
+            val lnUrlWithdraw = parseLnUrlWithdraw()
+            Timber.d("Showing LN payment expired notification")
+            notificationService.showLnPaymentExpiredNotification(lnUrlWithdraw)
+            Result.success()
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to process LN payment failed notification")
+            Result.failure()
+        }
+    }
 
-        val inputData = params.inputData
-        val lnUrlWithdraw = LnUrlWithdraw.deserialize(inputData.getString(LNURL_WITHDRAW)!!)
+    private fun parseLnUrlWithdraw(): LnUrlWithdraw {
+        val serialized = inputData.getString(LNURL_WITHDRAW_KEY)
+            ?: throw IllegalArgumentException("Missing LNURL withdraw data in input")
 
-        notificationService.showLnPaymentExpiredNotification(lnUrlWithdraw)
-
-        return Result.success()
+        return try {
+            LnUrlWithdraw.deserialize(serialized)
+        } catch (e: Exception) {
+            throw LnUrlWithdrawParseError(serialized, e)
+        }
     }
 }
