@@ -9,124 +9,164 @@ import io.muun.apollo.domain.model.report.CrashReport
 import io.muun.apollo.domain.model.user.User
 import rx.Single
 import timber.log.Timber
+import java.util.concurrent.ConcurrentSkipListMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
+private const val MAX_BREADCRUMBS = 100
+private const val BREADCRUMB_KEY_EVENT_NAME = "eventName"
+
 @Singleton
-class AnalyticsProvider @Inject constructor(context: Context) {
+class AnalyticsProvider @Inject constructor(
+    private val context: Context,
+    private val firebaseAnalytics: FirebaseAnalytics = FirebaseAnalytics.getInstance(context)
+) {
+    // Thread-safe sorted map for breadcrumbs with size limit
+    private val breadcrumbCollector = ConcurrentSkipListMap<Long, Bundle>().apply {
+        // Ensure we don't keep unlimited breadcrumbs
+        object : LinkedHashMap<Long, Bundle>(MAX_BREADCRUMBS + 1, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, Bundle>): Boolean {
+                return size > MAX_BREADCRUMBS
+            }
+        }
+    }
 
-    private val fba = FirebaseAnalytics.getInstance(context)
-
-    // Just for enriching error logs. A best effort to add metadata
-    private val inMemoryMapBreadcrumbCollector = sortedMapOf<Long, Bundle>()
-
+    /**
+     * Get the Firebase Analytics app instance ID (BigQuery pseudo ID)
+     */
     fun loadBigQueryPseudoId(): Single<String?> =
-        Single.fromEmitter<String> { emitter ->
-            fba.appInstanceId
-                .addOnSuccessListener { id: String? ->
-                    // id can be null on platforms without google play services.
+        Single.create { emitter ->
+            firebaseAnalytics.appInstanceId
+                .addOnSuccessListener { id ->
                     Timber.d("Loaded BigQueryPseudoId: $id")
                     emitter.onSuccess(id)
                 }
                 .addOnFailureListener { error ->
+                    Timber.e(error, "Failed to load BigQueryPseudoId")
                     emitter.onError(error)
                 }
         }
 
     /**
-     * Set the user's properties, to be used by Analytics.
+     * Set the user's properties for analytics tracking
      */
     fun setUserProperties(user: User) {
-        fba.setUserId(user.hid.toString())
-        fba.setUserProperty("currency", user.unsafeGetPrimaryCurrency().currencyCode)
-    }
-
-    fun resetUserProperties() {
-        fba.setUserId(null)
-        fba.setUserProperty("email", null)
+        try {
+            firebaseAnalytics.setUserId(user.hid.toString())
+            firebaseAnalytics.setUserProperty(
+                "currency", 
+                user.unsafeGetPrimaryCurrency().currencyCode
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to set user properties")
+            reportError("user_properties_error", e)
+        }
     }
 
     /**
-     * Report an AnalyticsEvent.
+     * Reset all user properties (on logout)
      */
-    fun report(event: AnalyticsEvent) {
+    fun resetUserProperties() {
         try {
-            actuallyReport(event)
-
-            // Avoid recursion (Timber.i reports a breadcrumb). TODO proper design and fix this
-            if (event !is AnalyticsEvent.E_BREADCRUMB) {
-                Timber.i("AnalyticsProvider: $event")
-            }
-
-        } catch (t: Throwable) {
-
-            val bundle = Bundle().apply { putString("event", event.eventId) }
-            fba.logEvent("e_tracking_error", bundle)
+            firebaseAnalytics.setUserId(null)
+            firebaseAnalytics.setUserProperty("email", null)
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to reset user properties")
+            reportError("reset_user_properties_error", e)
         }
     }
 
-    fun attachAnalyticsMetadata(report: CrashReport) {
-        report.metadata["breadcrumbs"] = getBreadcrumbMetadata()
-        report.metadata["displayMetrics"] = getDisplayMetricsMetadata()
+    /**
+     * Report an analytics event
+     */
+    fun report(event: AnalyticsEvent) {
+        if (event is AnalyticsEvent.E_BREADCRUMB) {
+            // Skip logging breadcrumbs to avoid recursion
+            actuallyReport(event)
+            return
+        }
+
+        try {
+            Timber.i("AnalyticsProvider: $event")
+            actuallyReport(event)
+        } catch (e: Throwable) {
+            Timber.e(e, "Failed to report analytics event: ${event.eventId}")
+            reportError("analytics_report_error", e, mapOf(
+                "event_id" to event.eventId
+            ))
+        }
     }
 
-    // PRIVATE STUFF
+    /**
+     * Attach analytics metadata to crash reports
+     */
+    fun attachAnalyticsMetadata(report: CrashReport) {
+        report.metadata.apply {
+            put("breadcrumbs", getBreadcrumbMetadata())
+            put("displayMetrics", getDisplayMetricsMetadata())
+        }
+    }
+
+    // ===== PRIVATE IMPLEMENTATION =====
 
     private fun actuallyReport(event: AnalyticsEvent) {
         val bundle = Bundle().apply {
-            putString("eventName", event.eventId)
-            event.metadata.forEach { putString(it.key, it.value.toString()) }
+            putString(BREADCRUMB_KEY_EVENT_NAME, event.eventId)
+            event.metadata.forEach { (key, value) ->
+                putString(key, value.toString())
+            }
         }
 
-        fba.logEvent(event.eventId, bundle)
-        inMemoryMapBreadcrumbCollector[System.currentTimeMillis()] = bundle
+        firebaseAnalytics.logEvent(event.eventId, bundle)
+        breadcrumbCollector[System.currentTimeMillis()] = bundle
+    }
+
+    private fun reportError(
+        errorType: String,
+        exception: Throwable,
+        additionalParams: Map<String, String> = emptyMap()
+    ) {
+        try {
+            val bundle = Bundle().apply {
+                putString("error_type", errorType)
+                putString("exception", exception.toString())
+                additionalParams.forEach { (key, value) ->
+                    putString(key, value)
+                }
+            }
+            firebaseAnalytics.logEvent("analytics_error", bundle)
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to report analytics error")
+        }
     }
 
     private fun getBreadcrumbMetadata(): String {
-        val builder = StringBuilder()
-        builder.append(" {\n")
-
-        val breadcrumbs: Map<Long, Bundle> = inMemoryMapBreadcrumbCollector
-
-        for (key in breadcrumbs.keys) {
-            val bundle = breadcrumbs.getValue(key)
-            val eventId = bundle["eventName"]
-            builder.append("\t$eventId={ ${serializeBundle(bundle)} }\n")
+        return buildString {
+            append("{\n")
+            breadcrumbCollector.forEach { (timestamp, bundle) ->
+                append("\t${bundle.getString(BREADCRUMB_KEY_EVENT_NAME)}={")
+                append(serializeBundle(bundle))
+                append("}\n")
+            }
+            append("}")
         }
-
-        builder.append("}\n")
-        return builder.toString()
     }
 
     private fun getDisplayMetricsMetadata(): String {
         val displayMetrics = Resources.getSystem().displayMetrics
-
-        val bundle = Bundle()
-        bundle.putInt("height", displayMetrics.heightPixels)
-        bundle.putInt("width", displayMetrics.widthPixels)
-        bundle.putFloat("density", displayMetrics.scaledDensity)
-
-        return " {\n\t${serializeBundle(bundle)}\n}"
+        val bundle = Bundle().apply {
+            putInt("height", displayMetrics.heightPixels)
+            putInt("width", displayMetrics.widthPixels)
+            putFloat("density", displayMetrics.scaledDensity)
+        }
+        return "{\n\t${serializeBundle(bundle)}\n}"
     }
 
     private fun serializeBundle(bundle: Bundle): String {
-        val builder = StringBuilder()
-        var first = true
-
-        for (param in bundle.keySet()) {
-
-            if (param == "eventName") {
-                continue // this is actually the breadcrumb key, let's avoid redundant info
+        return bundle.keySet()
+            .filterNot { it == BREADCRUMB_KEY_EVENT_NAME }
+            .joinToString(", ") { key ->
+                "$key=${bundle[key]}"
             }
-
-            if (!first) {
-                builder.append(", ")
-            }
-
-            builder.append("$param=%${bundle[param]}")
-            first = false
-        }
-
-        return builder.toString()
     }
 }
