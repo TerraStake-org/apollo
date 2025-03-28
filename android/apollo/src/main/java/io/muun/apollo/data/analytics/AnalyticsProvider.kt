@@ -15,19 +15,20 @@ import javax.inject.Singleton
 
 private const val MAX_BREADCRUMBS = 100
 private const val BREADCRUMB_KEY_EVENT_NAME = "eventName"
+private const val ANALYTICS_ERROR_EVENT = "analytics_error"
 
 @Singleton
 class AnalyticsProvider @Inject constructor(
     private val context: Context,
     private val firebaseAnalytics: FirebaseAnalytics = FirebaseAnalytics.getInstance(context)
 ) {
-    // Thread-safe sorted map for breadcrumbs with size limit
-    private val breadcrumbCollector = ConcurrentSkipListMap<Long, Bundle>().apply {
-        // Ensure we don't keep unlimited breadcrumbs
-        object : LinkedHashMap<Long, Bundle>(MAX_BREADCRUMBS + 1, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, Bundle>): Boolean {
-                return size > MAX_BREADCRUMBS
+    private val breadcrumbCollector = object : ConcurrentSkipListMap<Long, Bundle>() {
+        override fun put(key: Long, value: Bundle): Bundle? {
+            val result = super.put(key, value)
+            if (size > MAX_BREADCRUMBS) {
+                pollFirstEntry() // Remove oldest entry if we exceed max size
             }
+            return result
         }
     }
 
@@ -50,30 +51,20 @@ class AnalyticsProvider @Inject constructor(
     /**
      * Set the user's properties for analytics tracking
      */
-    fun setUserProperties(user: User) {
-        try {
-            firebaseAnalytics.setUserId(user.hid.toString())
-            firebaseAnalytics.setUserProperty(
-                "currency", 
-                user.unsafeGetPrimaryCurrency().currencyCode
-            )
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to set user properties")
-            reportError("user_properties_error", e)
-        }
+    fun setUserProperties(user: User) = safeOperation("user_properties_error") {
+        firebaseAnalytics.setUserId(user.hid.toString())
+        firebaseAnalytics.setUserProperty(
+            "currency", 
+            user.unsafeGetPrimaryCurrency().currencyCode
+        )
     }
 
     /**
      * Reset all user properties (on logout)
      */
-    fun resetUserProperties() {
-        try {
-            firebaseAnalytics.setUserId(null)
-            firebaseAnalytics.setUserProperty("email", null)
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to reset user properties")
-            reportError("reset_user_properties_error", e)
-        }
+    fun resetUserProperties() = safeOperation("reset_user_properties_error") {
+        firebaseAnalytics.setUserId(null)
+        firebaseAnalytics.setUserProperty("email", null)
     }
 
     /**
@@ -81,19 +72,13 @@ class AnalyticsProvider @Inject constructor(
      */
     fun report(event: AnalyticsEvent) {
         if (event is AnalyticsEvent.E_BREADCRUMB) {
-            // Skip logging breadcrumbs to avoid recursion
             actuallyReport(event)
             return
         }
 
-        try {
+        safeOperation("analytics_report_error", mapOf("event_id" to event.eventId)) {
             Timber.i("AnalyticsProvider: $event")
             actuallyReport(event)
-        } catch (e: Throwable) {
-            Timber.e(e, "Failed to report analytics event: ${event.eventId}")
-            reportError("analytics_report_error", e, mapOf(
-                "event_id" to event.eventId
-            ))
         }
     }
 
@@ -110,15 +95,27 @@ class AnalyticsProvider @Inject constructor(
     // ===== PRIVATE IMPLEMENTATION =====
 
     private fun actuallyReport(event: AnalyticsEvent) {
-        val bundle = Bundle().apply {
+        Bundle().apply {
             putString(BREADCRUMB_KEY_EVENT_NAME, event.eventId)
             event.metadata.forEach { (key, value) ->
                 putString(key, value.toString())
             }
+            firebaseAnalytics.logEvent(event.eventId, this)
+            breadcrumbCollector[System.currentTimeMillis()] = this
         }
+    }
 
-        firebaseAnalytics.logEvent(event.eventId, bundle)
-        breadcrumbCollector[System.currentTimeMillis()] = bundle
+    private inline fun safeOperation(
+        errorType: String,
+        additionalParams: Map<String, String> = emptyMap(),
+        operation: () -> Unit
+    ) {
+        try {
+            operation()
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to execute analytics operation: $errorType")
+            reportError(errorType, e, additionalParams)
+        }
     }
 
     private fun reportError(
@@ -127,46 +124,42 @@ class AnalyticsProvider @Inject constructor(
         additionalParams: Map<String, String> = emptyMap()
     ) {
         try {
-            val bundle = Bundle().apply {
+            Bundle().apply {
                 putString("error_type", errorType)
                 putString("exception", exception.toString())
                 additionalParams.forEach { (key, value) ->
                     putString(key, value)
                 }
+                firebaseAnalytics.logEvent(ANALYTICS_ERROR_EVENT, this)
             }
-            firebaseAnalytics.logEvent("analytics_error", bundle)
         } catch (e: Exception) {
             Timber.e(e, "Failed to report analytics error")
         }
     }
 
     private fun getBreadcrumbMetadata(): String {
-        return buildString {
-            append("{\n")
-            breadcrumbCollector.forEach { (timestamp, bundle) ->
-                append("\t${bundle.getString(BREADCRUMB_KEY_EVENT_NAME)}={")
-                append(serializeBundle(bundle))
-                append("}\n")
-            }
-            append("}")
+        return breadcrumbCollector.entries.joinToString(
+            prefix = "{\n",
+            postfix = "\n}",
+            separator = "\n"
+        ) { (_, bundle) ->
+            "\t${bundle.getString(BREADCRUMB_KEY_EVENT_NAME)}={" +
+            bundle.keySet()
+                .filterNot { it == BREADCRUMB_KEY_EVENT_NAME }
+                .joinToString(", ") { key -> "$key=${bundle[key]}" } +
+            "}"
         }
     }
 
     private fun getDisplayMetricsMetadata(): String {
-        val displayMetrics = Resources.getSystem().displayMetrics
-        val bundle = Bundle().apply {
-            putInt("height", displayMetrics.heightPixels)
-            putInt("width", displayMetrics.widthPixels)
-            putFloat("density", displayMetrics.scaledDensity)
+        return Resources.getSystem().displayMetrics.let { metrics ->
+            "{\n\t" +
+            listOf(
+                "height=${metrics.heightPixels}",
+                "width=${metrics.widthPixels}",
+                "density=${metrics.scaledDensity}"
+            ).joinToString(", ") +
+            "\n}"
         }
-        return "{\n\t${serializeBundle(bundle)}\n}"
-    }
-
-    private fun serializeBundle(bundle: Bundle): String {
-        return bundle.keySet()
-            .filterNot { it == BREADCRUMB_KEY_EVENT_NAME }
-            .joinToString(", ") { key ->
-                "$key=${bundle[key]}"
-            }
     }
 }
