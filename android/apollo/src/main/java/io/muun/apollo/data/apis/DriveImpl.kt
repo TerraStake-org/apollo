@@ -1,13 +1,15 @@
-package io.muun.apollo.data.apis
-
+// Android Framework
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+
+// Google Auth & Drive
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.android.gms.auth.api.signin.GoogleSignInAccount
 import com.google.android.gms.auth.api.signin.GoogleSignInClient
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.Scopes
+import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.common.api.Scope
 import com.google.android.gms.tasks.Tasks
 import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
@@ -16,149 +18,110 @@ import com.google.api.client.http.javanet.NetHttpTransport
 import com.google.api.client.json.gson.GsonFactory
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.DriveScopes
+import com.google.api.services.drive.model.File as FileMetadata
 import com.google.api.services.drive.model.Revision
+
+// Kotlin Coroutines
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.tasks.await
+
+// Dependency Injection
+import dagger.Module
+import dagger.Provides
+import dagger.hilt.InstallIn
+import dagger.hilt.android.qualifiers.ApplicationContext
+import dagger.hilt.components.SingletonComponent
+import javax.inject.Inject
+import javax.inject.Qualifier
+import javax.inject.Singleton
+
+// RxJava (if maintaining backward compatibility)
+import io.reactivex.Observable
+import io.reactivex.schedulers.Schedulers
+
+// Utilities
 import io.muun.common.utils.Preconditions
-import rx.Observable
-import rx.schedulers.Schedulers
-import rx.subjects.PublishSubject
 import timber.log.Timber
 import java.io.File
 import java.util.concurrent.Executor
-import javax.inject.Inject
-import javax.inject.Singleton
-
-private const val MAX_RESULTS = 100
-private const val ALL_FIELDS = "*"
-private const val DRIVE_FOLDER_TYPE = "application/vnd.google-apps.folder"
-private const val DRIVE_FOLDER_NAME = "Muun"
-private const val DRIVE_FOLDER_PARENT = "root"
-
+import kotlin.contracts.contract
 @Singleton
-class DriveImpl @Inject constructor(
+class DriveManager @Inject constructor(
     private val context: Context,
-    private val executor: Executor
+    @IoDispatcher private val dispatcher: CoroutineDispatcher,
+    private val signInClient: GoogleSignInClient,
+    private val driveService: Drive
 ) : DriveAuthenticator, DriveUploader {
-
-    private val signInClient by lazy { createSignInClient() }
 
     override fun getSignInIntent(): Intent = signInClient.signInIntent
 
-    override fun getSignedInAccount(resultIntent: Intent?): GoogleSignInAccount {
-        return try {
-            val completedTask = GoogleSignIn.getSignedInAccountFromIntent(resultIntent)
-            if (completedTask.isSuccessful) {
-                completedTask.result ?: throw DriveError("Null account returned")
-            } else {
-                throw DriveError(completedTask.exception ?: Exception("Unknown error"))
+    override suspend fun getSignedInAccount(resultIntent: Intent?): GoogleSignInAccount =
+        withContext(dispatcher) {
+            try {
+                val task = GoogleSignIn.getSignedInAccountFromIntent(resultIntent)
+                task.await() ?: throw DriveError(NullPointerException("Null account returned"))
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to get signed in account")
+                throw DriveError(e)
             }
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to get signed in account")
-            throw DriveError(e)
         }
-    }
 
     override fun upload(
         file: File,
         mimeType: String,
         uniqueProp: String,
         props: Map<String, String>
-    ): Observable<DriveFile> {
-        Preconditions.checkArgument(props.containsKey(uniqueProp))
-        
-        val resultSubject = PublishSubject.create<DriveFile>()
-        
-        Tasks.call(executor) {
+    ): Flow<DriveFile> = flow {
+        require(props.containsKey(uniqueProp)) { 
+            "Missing required property: $uniqueProp" 
+        }
+        require(file.exists()) { "File ${file.path} doesn't exist" }
+
+        val driveFile = withContext(dispatcher) {
             executeUpload(file, mimeType, uniqueProp, props)
-        }.addOnSuccessListener { driveFile ->
-            resultSubject.onNext(driveFile)
-            resultSubject.onCompleted()
-        }.addOnFailureListener { error ->
-            Timber.e(error, "Failed to upload file")
-            resultSubject.onError(DriveError(error))
-            resultSubject.onCompleted()
         }
-
-        return resultSubject
-            .asObservable()
-            .observeOn(Schedulers.from(executor))
+        emit(driveFile)
+    }.catch { error ->
+        Timber.e(error, "Failed to upload file")
+        throw DriveError(error)
     }
 
-    override fun open(activityContext: Context, driveFile: DriveFile) {
+    override suspend fun signOut() {
         try {
-            val link = driveFile.parent?.link ?: driveFile.link
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(link)).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            activityContext.startActivity(intent)
+            signInClient.revokeAccess().await()
+            signInClient.signOut().await()
+            Timber.d("Successfully signed out from Drive")
         } catch (e: Exception) {
-            Timber.e(e, "Failed to open Drive file")
+            Timber.e(e, "Failed to sign out from Drive")
             throw DriveError(e)
         }
     }
 
-    override fun signOut() {
-        signInClient.revokeAccess()
-            .continueWith { signInClient.signOut() }
-            .addOnCompleteListener {
-                Timber.d("Successfully signed out from Drive")
-            }
-            .addOnFailureListener { error ->
-                Timber.e(error, "Failed to sign out from Drive")
-            }
-    }
-
-    private fun createDriveService(): Drive {
-        return try {
-            val credential = GoogleAccountCredential
-                .usingOAuth2(context, listOf(DriveScopes.DRIVE_FILE))
-                .apply {
-                    selectedAccount = GoogleSignIn.getLastSignedInAccount(context)?.account
-                        ?: throw IllegalStateException("No signed in account")
-                }
-
-            Drive.Builder(NetHttpTransport(), GsonFactory(), credential)
-                .setApplicationName("Muun")
-                .build()
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to create Drive service")
-            throw DriveError(e)
-        }
-    }
-
-    private fun createSignInClient(): GoogleSignInClient {
-        val options = GoogleSignInOptions.Builder()
-            .requestScopes(Scope(Scopes.DRIVE_FILE))
-            .requestEmail()
-            .build()
-
-        return GoogleSignIn.getClient(context, options)
-    }
-
-    private fun executeUpload(
+    private suspend fun executeUpload(
         file: File,
         mimeType: String,
         uniqueProp: String,
         props: Map<String, String>
     ): DriveFile {
-        val driveService = createDriveService()
-        val folder = getOrCreateMuunFolder(driveService)
-
-        val updateCandidates = getUpdateCandidates(driveService, file.name, mimeType, folder)
+        val folder = getOrCreateMuunFolder()
+        val updateCandidates = getUpdateCandidates(file.name, mimeType, folder)
         val fileToUpdate = findFileToUpdate(updateCandidates, uniqueProp, props[uniqueProp]!!)
 
         return if (fileToUpdate != null) {
-            updateFile(driveService, fileToUpdate, file, props, keepRevision = true)
+            updateFile(fileToUpdate, file, props, keepRevision = true)
         } else {
-            createFile(driveService, mimeType, file, folder, props)
+            createFile(mimeType, file, folder, props)
         }
     }
 
-    private fun getOrCreateMuunFolder(driveService: Drive): DriveFile {
-        return getExistingMuunFolder(driveService) ?: createNewMuunFolder(driveService)
-    }
+    private suspend fun getOrCreateMuunFolder(): DriveFile =
+        getExistingMuunFolder() ?: createNewMuunFolder()
 
-    private fun createFile(
-        driveService: Drive,
+    private suspend fun createFile(
         mimeType: String,
         file: File,
         folder: DriveFile,
@@ -171,141 +134,88 @@ class DriveImpl @Inject constructor(
             appProperties = props
         }
 
-        val content = FileContent(mimeType, file)
-
         return driveService.files()
-            .create(metadata, content)
+            .create(metadata, FileContent(mimeType, file))
             .setFields(ALL_FIELDS)
-            .execute()
-            .let { toDriveFile(it, folder) }
+            .await()
+            .toDriveFile(folder)
     }
 
-    private fun updateFile(
-        driveService: Drive,
-        existingFile: DriveFile,
-        newContent: File,
-        newProps: Map<String, String>,
-        keepRevision: Boolean
-    ): DriveFile {
-        if (keepRevision) {
-            setKeepRevision(driveService, existingFile)
-        }
-
-        val metadata = FileMetadata().apply {
-            appProperties = newProps
-        }
-
-        val content = FileContent(existingFile.mimeType, newContent)
-
-        return driveService.files()
-            .update(existingFile.id, metadata, content)
-            .setFields(ALL_FIELDS)
-            .execute()
-            .let { toDriveFile(it, existingFile.parent) }
-    }
-
-    private fun setKeepRevision(driveService: Drive, file: DriveFile) {
-        try {
-            val revision = Revision().apply {
-                keepForever = true
-            }
-            driveService.revisions()
-                .update(file.id, file.revisionId, revision)
-                .execute()
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to set keepForever on revision")
-        }
-    }
-
-    private fun createNewMuunFolder(driveService: Drive): DriveFile {
-        val metadata = FileMetadata().apply {
-            parents = listOf(DRIVE_FOLDER_PARENT)
-            mimeType = DRIVE_FOLDER_TYPE
-            name = DRIVE_FOLDER_NAME
-        }
-
-        return driveService.files()
-            .create(metadata)
-            .setFields(ALL_FIELDS)
-            .execute()
-            .let { toDriveFile(it) }
-    }
-
-    private fun getExistingMuunFolder(driveService: Drive): DriveFile? {
-        val query = buildDriveQuery(
-            mimeType = DRIVE_FOLDER_TYPE,
-            name = DRIVE_FOLDER_NAME,
-            parentId = DRIVE_FOLDER_PARENT
-        )
-
-        return driveService.files()
-            .list()
-            .setQ(query)
-            .setFields(ALL_FIELDS)
-            .execute()
-            .files
-            .firstOrNull()
-            ?.let { toDriveFile(it) }
-    }
-
-    private fun getUpdateCandidates(
-        driveService: Drive,
-        name: String,
-        mimeType: String,
-        folder: DriveFile
-    ): List<DriveFile> {
-        val query = buildDriveQuery(
-            mimeType = mimeType,
-            name = name,
-            parentId = folder.id
-        )
-
-        return driveService.files()
-            .list()
-            .setQ(query)
-            .setFields(ALL_FIELDS)
-            .setMaxResults(MAX_RESULTS.toLong())
-            .execute()
-            .files
-            .map { toDriveFile(it) }
-    }
-
-    private fun findFileToUpdate(
-        candidates: List<DriveFile>,
-        uniqueProp: String,
-        uniqueValue: String
-    ): DriveFile? {
-        return when {
-            candidates.size == 1 && !candidates[0].properties.containsKey(uniqueProp) -> 
-                candidates[0]
-            else -> 
-                candidates.find { it.properties[uniqueProp] == uniqueValue }
-        }
-    }
-
-    private fun buildDriveQuery(
-        mimeType: String,
-        name: String,
-        parentId: String
-    ): String {
-        return """
-            mimeType='$mimeType' and 
-            name='$name' and 
-            '$parentId' in parents and
-            trashed=false
-        """.trimIndent().replace("\n", " ")
-    }
-
-    private fun toDriveFile(metadata: FileMetadata, parentFile: DriveFile? = null): DriveFile {
-        return DriveFile(
-            id = metadata.id,
-            revisionId = metadata.headRevisionId ?: "",
-            name = metadata.name,
-            mimeType = metadata.mimeType,
-            size = metadata.size,
-            link = metadata.webViewLink,
-            parent = parentFile,
-            properties = metadata.appProperties ?: emptyMap()
-        )
+    companion object {
+        private const val MAX_RESULTS = 100
+        private const val ALL_FIELDS = "*"
+        private const val DRIVE_FOLDER_TYPE = "application/vnd.google-apps.folder"
+        private const val DRIVE_FOLDER_NAME = "Muun"
+        private const val DRIVE_FOLDER_PARENT = "root"
     }
 }
+
+// Factory for DI
+@Module
+@InstallIn(SingletonComponent::class)
+object DriveModule {
+
+    @Provides
+    @Singleton
+    fun provideGoogleSignInClient(
+        context: Context,
+        @DriveScopes scopes: List<Scope>
+    ): GoogleSignInClient {
+        val options = GoogleSignInOptions.Builder()
+            .apply { scopes.forEach { requestScopes(it) } }
+            .requestEmail()
+            .build()
+
+        return GoogleSignIn.getClient(context, options)
+    }
+
+    @Provides
+    @Singleton
+    fun provideDriveService(
+        context: Context,
+        credential: GoogleAccountCredential
+    ): Drive = Drive.Builder(
+        NetHttpTransport(),
+        GsonFactory(),
+        credential
+    ).setApplicationName("Muun")
+     .build()
+
+    @Provides
+    @Singleton
+    fun provideGoogleAccountCredential(
+        context: Context,
+        @DriveScopes scopes: List<String>
+    ): GoogleAccountCredential = GoogleAccountCredential
+        .usingOAuth2(context, scopes)
+
+    @Provides
+    @DriveScopes
+    fun provideDriveScopes(): List<String> = listOf(DriveScopes.DRIVE_FILE)
+
+    @Provides
+    @DriveScopes
+    fun provideGoogleScopes(): List<Scope> = listOf(Scope(Scopes.DRIVE_FILE))
+}
+
+// Extension functions
+private suspend fun <T> Task<T>.await(): T = suspendCancellableCoroutine { cont ->
+    addOnCompleteListener { task ->
+        when {
+            task.isCanceled -> cont.cancel()
+            task.isSuccessful -> cont.resume(task.result)
+            else -> cont.resumeWithException(task.exception ?: Exception("Unknown error"))
+        }
+    }
+}
+
+private fun FileMetadata.toDriveFile(parent: DriveFile? = null): DriveFile = DriveFile(
+    id = checkNotNull(id) { "File ID is required" },
+    revisionId = headRevisionId ?: "",
+    name = checkNotNull(name) { "File name is required" },
+    mimeType = checkNotNull(mimeType) { "MIME type is required" },
+    size = size ?: 0L,
+    link = webViewLink ?: "",
+    parent = parent,
+    properties = appProperties ?: emptyMap()
+)
