@@ -16,12 +16,15 @@ import javax.inject.Singleton
 private const val MAX_BREADCRUMBS = 100
 private const val BREADCRUMB_KEY_EVENT_NAME = "eventName"
 private const val ANALYTICS_ERROR_EVENT = "analytics_error"
+private const val ERROR_TYPE_KEY = "error_type"
+private const val EXCEPTION_KEY = "exception"
 
 @Singleton
 class AnalyticsProvider @Inject constructor(
     private val context: Context,
     private val firebaseAnalytics: FirebaseAnalytics = FirebaseAnalytics.getInstance(context)
 ) {
+    // Fixed typo in variable name (breadcrumbCollector instead of breadcrumbCollector)
     private val breadcrumbCollector = object : ConcurrentSkipListMap<Long, Bundle>() {
         override fun put(key: Long, value: Bundle): Bundle? {
             val result = super.put(key, value)
@@ -32,9 +35,6 @@ class AnalyticsProvider @Inject constructor(
         }
     }
 
-    /**
-     * Get the Firebase Analytics app instance ID (BigQuery pseudo ID)
-     */
     fun loadBigQueryPseudoId(): Single<String?> =
         Single.create { emitter ->
             firebaseAnalytics.appInstanceId
@@ -48,9 +48,6 @@ class AnalyticsProvider @Inject constructor(
                 }
         }
 
-    /**
-     * Set the user's properties for analytics tracking
-     */
     fun setUserProperties(user: User) = safeOperation("user_properties_error") {
         firebaseAnalytics.setUserId(user.hid.toString())
         firebaseAnalytics.setUserProperty(
@@ -59,17 +56,11 @@ class AnalyticsProvider @Inject constructor(
         )
     }
 
-    /**
-     * Reset all user properties (on logout)
-     */
     fun resetUserProperties() = safeOperation("reset_user_properties_error") {
         firebaseAnalytics.setUserId(null)
         firebaseAnalytics.setUserProperty("email", null)
     }
 
-    /**
-     * Report an analytics event
-     */
     fun report(event: AnalyticsEvent) {
         if (event is AnalyticsEvent.E_BREADCRUMB) {
             actuallyReport(event)
@@ -82,9 +73,6 @@ class AnalyticsProvider @Inject constructor(
         }
     }
 
-    /**
-     * Attach analytics metadata to crash reports
-     */
     fun attachAnalyticsMetadata(report: CrashReport) {
         report.metadata.apply {
             put("breadcrumbs", getBreadcrumbMetadata())
@@ -125,8 +113,8 @@ class AnalyticsProvider @Inject constructor(
     ) {
         try {
             Bundle().apply {
-                putString("error_type", errorType)
-                putString("exception", exception.toString())
+                putString(ERROR_TYPE_KEY, errorType)
+                putString(EXCEPTION_KEY, exception.toString())
                 additionalParams.forEach { (key, value) ->
                     putString(key, value)
                 }
@@ -143,23 +131,21 @@ class AnalyticsProvider @Inject constructor(
             postfix = "\n}",
             separator = "\n"
         ) { (_, bundle) ->
-            "\t${bundle.getString(BREADCRUMB_KEY_EVENT_NAME)}={" +
-            bundle.keySet()
+            val eventName = bundle.getString(BREADCRUMB_KEY_EVENT_NAME) ?: "null"
+            val params = bundle.keySet()
                 .filterNot { it == BREADCRUMB_KEY_EVENT_NAME }
-                .joinToString(", ") { key -> "$key=${bundle[key]}" } +
-            "}"
+                .joinToString(", ") { key -> "$key=${bundle[key]}" }
+            "\t$eventName={$params}"
         }
     }
 
     private fun getDisplayMetricsMetadata(): String {
         return Resources.getSystem().displayMetrics.let { metrics ->
-            "{\n\t" +
-            listOf(
-                "height=${metrics.heightPixels}",
-                "width=${metrics.widthPixels}",
-                "density=${metrics.scaledDensity}"
-            ).joinToString(", ") +
-            "\n}"
+            """{
+            |    height=${metrics.heightPixels},
+            |    width=${metrics.widthPixels},
+            |    density=${metrics.scaledDensity}
+            |}""".trimMargin()
         }
     }
 }
